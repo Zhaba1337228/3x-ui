@@ -22,6 +22,7 @@ import (
 
 	"github.com/mhsanaei/3x-ui/v2/config"
 	"github.com/mhsanaei/3x-ui/v2/database"
+	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/common"
 	"github.com/mhsanaei/3x-ui/v2/util/sys"
@@ -34,6 +35,8 @@ import (
 	"github.com/shirou/gopsutil/v4/load"
 	"github.com/shirou/gopsutil/v4/mem"
 	"github.com/shirou/gopsutil/v4/net"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 // ProcessState represents the current state of a system process.
@@ -191,6 +194,20 @@ type LogEntry struct {
 	Outbound    string
 	Email       string
 	Event       int
+}
+
+type DatabaseBackup struct {
+	Version       string `json:"version"`
+	SourceDialect string `json:"sourceDialect"`
+	ExportedAt    int64  `json:"exportedAt"`
+
+	Users            []model.User             `json:"users"`
+	Inbounds         []model.Inbound          `json:"inbounds"`
+	OutboundTraffics []model.OutboundTraffics `json:"outboundTraffics"`
+	Settings         []model.Setting          `json:"settings"`
+	InboundClientIps []model.InboundClientIps `json:"inboundClientIps"`
+	ClientTraffics   []xray.ClientTraffic     `json:"clientTraffics"`
+	HistoryOfSeeders []model.HistoryOfSeeders `json:"historyOfSeeders"`
 }
 
 func getPublicIP(url string) string {
@@ -881,48 +898,234 @@ func (s *ServerService) GetConfigJson() (any, error) {
 	return jsonData, nil
 }
 
-func (s *ServerService) GetDb() ([]byte, error) {
+func (s *ServerService) buildDatabaseBackup(db *gorm.DB, sourceDialect string) (*DatabaseBackup, error) {
+	backup := &DatabaseBackup{
+		Version:       "1",
+		SourceDialect: sourceDialect,
+		ExportedAt:    time.Now().Unix(),
+	}
+
+	loaders := []struct {
+		name string
+		fn   func() error
+	}{
+		{"users", func() error { return db.Order("id ASC").Find(&backup.Users).Error }},
+		{"inbounds", func() error { return db.Order("id ASC").Find(&backup.Inbounds).Error }},
+		{"outbound_traffics", func() error { return db.Order("id ASC").Find(&backup.OutboundTraffics).Error }},
+		{"settings", func() error { return db.Order("id ASC").Find(&backup.Settings).Error }},
+		{"inbound_client_ips", func() error { return db.Order("id ASC").Find(&backup.InboundClientIps).Error }},
+		{"client_traffics", func() error { return db.Order("id ASC").Find(&backup.ClientTraffics).Error }},
+		{"history_of_seeders", func() error { return db.Order("id ASC").Find(&backup.HistoryOfSeeders).Error }},
+	}
+	for _, loader := range loaders {
+		if err := loader.fn(); err != nil {
+			return nil, common.NewErrorf("failed to export %s: %v", loader.name, err)
+		}
+	}
+
+	return backup, nil
+}
+
+func (s *ServerService) resetPostgresSequences(tx *gorm.DB) error {
+	if !database.IsPostgres() {
+		return nil
+	}
+	statements := []string{
+		"SELECT setval(pg_get_serial_sequence('users', 'id'), COALESCE((SELECT MAX(id) FROM users), 1), true)",
+		"SELECT setval(pg_get_serial_sequence('inbounds', 'id'), COALESCE((SELECT MAX(id) FROM inbounds), 1), true)",
+		"SELECT setval(pg_get_serial_sequence('outbound_traffics', 'id'), COALESCE((SELECT MAX(id) FROM outbound_traffics), 1), true)",
+		"SELECT setval(pg_get_serial_sequence('settings', 'id'), COALESCE((SELECT MAX(id) FROM settings), 1), true)",
+		"SELECT setval(pg_get_serial_sequence('inbound_client_ips', 'id'), COALESCE((SELECT MAX(id) FROM inbound_client_ips), 1), true)",
+		"SELECT setval(pg_get_serial_sequence('client_traffics', 'id'), COALESCE((SELECT MAX(id) FROM client_traffics), 1), true)",
+		"SELECT setval(pg_get_serial_sequence('history_of_seeders', 'id'), COALESCE((SELECT MAX(id) FROM history_of_seeders), 1), true)",
+	}
+	for _, stmt := range statements {
+		if err := tx.Exec(stmt).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *ServerService) restoreBackupToCurrentDB(backup *DatabaseBackup) error {
+	db := database.GetDB()
+	return db.Transaction(func(tx *gorm.DB) error {
+		deletions := []any{
+			&xray.ClientTraffic{},
+			&model.InboundClientIps{},
+			&model.OutboundTraffics{},
+			&model.HistoryOfSeeders{},
+			&model.Inbound{},
+			&model.Setting{},
+			&model.User{},
+		}
+		for _, item := range deletions {
+			if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(item).Error; err != nil {
+				return err
+			}
+		}
+
+		insert := func(items any) error {
+			return tx.Session(&gorm.Session{CreateBatchSize: 200}).Create(items).Error
+		}
+
+		if len(backup.Users) > 0 {
+			if err := insert(&backup.Users); err != nil {
+				return err
+			}
+		}
+		if len(backup.Inbounds) > 0 {
+			if err := insert(&backup.Inbounds); err != nil {
+				return err
+			}
+		}
+		if len(backup.OutboundTraffics) > 0 {
+			if err := insert(&backup.OutboundTraffics); err != nil {
+				return err
+			}
+		}
+		if len(backup.Settings) > 0 {
+			if err := insert(&backup.Settings); err != nil {
+				return err
+			}
+		}
+		if len(backup.InboundClientIps) > 0 {
+			if err := insert(&backup.InboundClientIps); err != nil {
+				return err
+			}
+		}
+		if len(backup.ClientTraffics) > 0 {
+			if err := insert(&backup.ClientTraffics); err != nil {
+				return err
+			}
+		}
+		if len(backup.HistoryOfSeeders) > 0 {
+			if err := insert(&backup.HistoryOfSeeders); err != nil {
+				return err
+			}
+		}
+
+		return s.resetPostgresSequences(tx)
+	})
+}
+
+func (s *ServerService) loadSQLiteBackup(dbPath string) (*DatabaseBackup, error) {
+	sqliteDB, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	if err != nil {
+		return nil, err
+	}
+	sqlDB, err := sqliteDB.DB()
+	if err != nil {
+		return nil, err
+	}
+	defer sqlDB.Close()
+
+	var integrity string
+	if err := sqliteDB.Raw("PRAGMA integrity_check;").Scan(&integrity).Error; err != nil {
+		return nil, err
+	}
+	if integrity != "ok" {
+		return nil, common.NewErrorf("sqlite integrity check failed: %s", integrity)
+	}
+
+	return s.buildDatabaseBackup(sqliteDB, "sqlite")
+}
+
+func (s *ServerService) importSQLiteIntoCurrentDB(file multipart.File) error {
+	tempFile, err := os.CreateTemp("", "x-ui-import-*.db")
+	if err != nil {
+		return common.NewErrorf("Error creating temporary db file: %v", err)
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+
+	if _, err := io.Copy(tempFile, file); err != nil {
+		tempFile.Close()
+		return common.NewErrorf("Error saving db: %v", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return common.NewErrorf("Error closing temporary db file: %v", err)
+	}
+
+	backup, err := s.loadSQLiteBackup(tempPath)
+	if err != nil {
+		return common.NewErrorf("Invalid or corrupt sqlite db file: %v", err)
+	}
+
+	return s.restoreBackupToCurrentDB(backup)
+}
+
+func (s *ServerService) importJSONBackup(file multipart.File) error {
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return common.NewErrorf("Error reading backup file: %v", err)
+	}
+	backup := &DatabaseBackup{}
+	if err := json.Unmarshal(raw, backup); err != nil {
+		return common.NewErrorf("Invalid backup file: %v", err)
+	}
+	return s.restoreBackupToCurrentDB(backup)
+}
+
+func (s *ServerService) GetDb() ([]byte, string, error) {
 	if !database.IsSQLite() {
-		return nil, common.NewError("database file export is only supported for sqlite")
+		backup, err := s.buildDatabaseBackup(database.GetDB(), database.GetDialect())
+		if err != nil {
+			return nil, "", err
+		}
+		payload, err := json.MarshalIndent(backup, "", "  ")
+		if err != nil {
+			return nil, "", err
+		}
+		return payload, "x-ui-backup.json", nil
 	}
 	// Update by manually trigger a checkpoint operation
 	err := database.Checkpoint()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// Open the file for reading
 	file, err := os.Open(config.GetDBPath())
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer file.Close()
 
 	// Read the file contents
 	fileContents, err := io.ReadAll(file)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	return fileContents, nil
+	return fileContents, "x-ui.db", nil
 }
 
 func (s *ServerService) ImportDB(file multipart.File) error {
-	if !database.IsSQLite() {
-		return common.NewError("database file import is only supported for sqlite")
+	if errStop := s.StopXrayService(); errStop != nil {
+		logger.Warningf("Failed to stop Xray before DB import: %v", errStop)
 	}
+
 	// Check if the file is a SQLite database
 	isValidDb, err := database.IsSQLiteDB(file)
 	if err != nil {
 		return common.NewErrorf("Error checking db file format: %v", err)
 	}
 	if !isValidDb {
-		return common.NewError("Invalid db file format")
+		_, err = file.Seek(0, 0)
+		if err != nil {
+			return common.NewErrorf("Error resetting file reader: %v", err)
+		}
+		return s.importJSONBackup(file)
 	}
 
 	// Reset the file reader to the beginning
 	_, err = file.Seek(0, 0)
 	if err != nil {
 		return common.NewErrorf("Error resetting file reader: %v", err)
+	}
+
+	if database.IsPostgres() {
+		return s.importSQLiteIntoCurrentDB(file)
 	}
 
 	// Save the file as a temporary file
@@ -969,11 +1172,6 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 	// Validate integrity (no migrations / side effects)
 	if err = database.ValidateSQLiteDB(tempPath); err != nil {
 		return common.NewErrorf("Invalid or corrupt db file: %v", err)
-	}
-
-	// Stop Xray (ignore error but log)
-	if errStop := s.StopXrayService(); errStop != nil {
-		logger.Warningf("Failed to stop Xray before DB import: %v", errStop)
 	}
 
 	// Close existing DB to release file locks (especially on Windows)

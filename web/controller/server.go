@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/web/global"
@@ -253,13 +254,11 @@ func (a *ServerController) getConfigJson(c *gin.Context) {
 
 // getDb downloads the database file.
 func (a *ServerController) getDb(c *gin.Context) {
-	db, err := a.serverService.GetDb()
+	db, filename, err := a.serverService.GetDb()
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.index.getDatabaseError"), err)
 		return
 	}
-
-	filename := "x-ui.db"
 
 	if !isValidFilename(filename) {
 		c.AbortWithError(http.StatusBadRequest, fmt.Errorf("invalid filename"))
@@ -267,7 +266,11 @@ func (a *ServerController) getDb(c *gin.Context) {
 	}
 
 	// Set the headers for the response
-	c.Header("Content-Type", "application/octet-stream")
+	if strings.HasSuffix(filename, ".json") {
+		c.Header("Content-Type", "application/json")
+	} else {
+		c.Header("Content-Type", "application/octet-stream")
+	}
 	c.Header("Content-Disposition", "attachment; filename="+filename)
 
 	// Write the file contents to the response
