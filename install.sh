@@ -73,6 +73,52 @@ is_port_in_use() {
     return 1
 }
 
+get_listening_process_for_port() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print; exit}'
+        return
+    fi
+    return 1
+}
+
+postgres_cluster_on_port() {
+    local pg_port="$1"
+    if ! command -v pg_lsclusters >/dev/null 2>&1; then
+        return 1
+    fi
+    pg_lsclusters --no-header 2>/dev/null | awk -v p="${pg_port}" '$3 == p {found=1} END {exit(found ? 0 : 1)}'
+}
+
+choose_postgres_port() {
+    local default_port="${1:-5432}"
+    local selected_port=""
+    while true; do
+        read -rp "PostgreSQL port [default ${default_port}]: " selected_port
+        selected_port="${selected_port:-${default_port}}"
+
+        if ! [[ "${selected_port}" =~ ^[0-9]+$ ]] || ((selected_port < 1 || selected_port > 65535)); then
+            echo -e "${red}Invalid PostgreSQL port. Choose a number between 1 and 65535.${plain}"
+            continue
+        fi
+
+        if postgres_cluster_on_port "${selected_port}"; then
+            echo -e "${green}Existing PostgreSQL cluster already uses port ${selected_port}. Will reuse it.${plain}"
+            echo "${selected_port}"
+            return 0
+        fi
+
+        if is_port_in_use "${selected_port}"; then
+            echo -e "${red}Port ${selected_port} is already occupied. Choose another port.${plain}"
+            echo -e "${yellow}Listener:${plain} $(get_listening_process_for_port "${selected_port}")"
+            continue
+        fi
+
+        echo "${selected_port}"
+        return 0
+    done
+}
+
 install_base() {
     case "${release}" in
         ubuntu | debian | armbian)
@@ -243,15 +289,6 @@ ensure_postgres_running() {
     return 1
 }
 
-get_listening_process_for_port() {
-    local port="$1"
-    if command -v ss >/dev/null 2>&1; then
-        ss -ltnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print; exit}'
-        return
-    fi
-    return 1
-}
-
 configure_local_postgres_security() {
     local pg_port="$1"
     local pg_conf=""
@@ -302,6 +339,7 @@ bootstrap_local_postgres() {
     local db_user="$2"
     local db_password="$3"
     local pg_port="${4:-5432}"
+    local recreate_db="${5:-0}"
 
     ensure_postgres_running "${pg_port}" || return 1
 
@@ -320,7 +358,11 @@ SQL
 
         local db_exists
         db_exists=$(su - postgres -c "psql -p ${pg_port} -tAc \"SELECT 1 FROM pg_database WHERE datname='${db_name}'\"")
-        if [[ "${db_exists}" != "1" ]]; then
+        if [[ "${db_exists}" == "1" && "${recreate_db}" == "1" ]]; then
+            su - postgres -c "psql -p ${pg_port} -d postgres -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${db_name}' AND pid <> pg_backend_pid();\"" || return 1
+            su - postgres -c "dropdb -p ${pg_port} --if-exists ${db_name}" || return 1
+            su - postgres -c "createdb -p ${pg_port} -O ${db_user} ${db_name}" || return 1
+        elif [[ "${db_exists}" != "1" ]]; then
             su - postgres -c "createdb -p ${pg_port} -O ${db_user} ${db_name}" || return 1
         fi
     else
@@ -338,7 +380,11 @@ SQL
 
         local db_exists
         db_exists=$(psql -p "${pg_port}" -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db_name}'")
-        if [[ "${db_exists}" != "1" ]]; then
+        if [[ "${db_exists}" == "1" && "${recreate_db}" == "1" ]]; then
+            psql -p "${pg_port}" -U postgres -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${db_name}' AND pid <> pg_backend_pid();" || return 1
+            dropdb -p "${pg_port}" -U postgres --if-exists "${db_name}" || return 1
+            createdb -p "${pg_port}" -U postgres -O "${db_user}" "${db_name}" || return 1
+        elif [[ "${db_exists}" != "1" ]]; then
             createdb -p "${pg_port}" -U postgres -O "${db_user}" "${db_name}" || return 1
         fi
     fi
@@ -389,10 +435,10 @@ configure_database_env() {
     local pg_user="xui"
     local pg_password=""
     local pg_sslmode="disable"
+    local recreate_db="0"
 
     if [[ "${pg_mode}" == "1" ]]; then
-        read -rp "PostgreSQL port [default 5432]: " pg_port
-        pg_port="${pg_port:-5432}"
+        pg_port=$(choose_postgres_port "5432") || return 1
         read -rp "Database name [default xui]: " pg_db
         pg_db="${pg_db:-xui}"
         read -rp "Database user [default xui]: " pg_user
@@ -408,7 +454,18 @@ configure_database_env() {
         configure_local_postgres_security "${pg_port}"
         pg_host="127.0.0.1"
         pg_sslmode="disable"
-        bootstrap_local_postgres "${pg_db}" "${pg_user}" "${pg_password}" "${pg_port}" || return 1
+        if id postgres >/dev/null 2>&1; then
+            local existing_db
+            existing_db=$(su - postgres -c "psql -p ${pg_port} -tAc \"SELECT 1 FROM pg_database WHERE datname='${pg_db}'\"" 2>/dev/null)
+            if [[ "${existing_db}" == "1" ]]; then
+                local recreate_choice=""
+                read -rp "Database '${pg_db}' already exists. Recreate it and remove old data? [y/N]: " recreate_choice
+                if [[ "${recreate_choice}" == "y" || "${recreate_choice}" == "Y" ]]; then
+                    recreate_db="1"
+                fi
+            fi
+        fi
+        bootstrap_local_postgres "${pg_db}" "${pg_user}" "${pg_password}" "${pg_port}" "${recreate_db}" || return 1
     else
         read -rp "PostgreSQL host [default 127.0.0.1]: " pg_host
         pg_host="${pg_host:-127.0.0.1}"
