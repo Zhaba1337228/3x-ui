@@ -11,6 +11,32 @@ services:
     environment:
       XRAY_VMESS_AEAD_FORCED: "false"
       XUI_ENABLE_FAIL2BAN: "true"
+      XUI_DB_DRIVER: ${XUI_DB_DRIVER:-sqlite}
+      XUI_POSTGRES_DSN: ${XUI_POSTGRES_DSN:-}
+      XUI_DB_MAX_IDLE_CONNS: ${XUI_DB_MAX_IDLE_CONNS:-10}
+      XUI_DB_MAX_OPEN_CONNS: ${XUI_DB_MAX_OPEN_CONNS:-50}
     tty: true
     network_mode: host
     restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: 3xui_postgres
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-xui}
+      POSTGRES_USER: ${POSTGRES_USER:-xui}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - 3xui_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xui} -d ${POSTGRES_DB:-xui}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  3xui_postgres_data:

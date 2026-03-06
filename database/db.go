@@ -5,6 +5,7 @@ package database
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -17,12 +18,14 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/util/crypto"
 	"github.com/mhsanaei/3x-ui/v2/xray"
 
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
 
 var db *gorm.DB
+var dialect string
 
 const (
 	defaultUsername = "admin"
@@ -121,10 +124,12 @@ func isTableEmpty(tableName string) (bool, error) {
 
 // InitDB sets up the database connection, migrates models, and runs seeders.
 func InitDB(dbPath string) error {
-	dir := path.Dir(dbPath)
-	err := os.MkdirAll(dir, fs.ModePerm)
-	if err != nil {
-		return err
+	if config.GetDBDriver() == "sqlite" {
+		dir := path.Dir(dbPath)
+		err := os.MkdirAll(dir, fs.ModePerm)
+		if err != nil {
+			return err
+		}
 	}
 
 	var gormLogger logger.Interface
@@ -138,10 +143,30 @@ func InitDB(dbPath string) error {
 	c := &gorm.Config{
 		Logger: gormLogger,
 	}
-	db, err = gorm.Open(sqlite.Open(dbPath), c)
+	var err error
+	switch config.GetDBDriver() {
+	case "sqlite":
+		dialect = "sqlite"
+		db, err = gorm.Open(sqlite.Open(dbPath), c)
+	case "postgres":
+		dsn := config.GetPostgresDSN()
+		if dsn == "" {
+			return fmt.Errorf("XUI_POSTGRES_DSN is required when XUI_DB_DRIVER=postgres")
+		}
+		dialect = "postgres"
+		db, err = gorm.Open(postgres.Open(dsn), c)
+	default:
+		return fmt.Errorf("unsupported database driver: %s", config.GetDBDriver())
+	}
 	if err != nil {
 		return err
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	sqlDB.SetMaxIdleConns(config.GetDBMaxIdleConns())
+	sqlDB.SetMaxOpenConns(config.GetDBMaxOpenConns())
 
 	if err := initModels(); err != nil {
 		return err
@@ -175,6 +200,18 @@ func GetDB() *gorm.DB {
 	return db
 }
 
+func GetDialect() string {
+	return dialect
+}
+
+func IsPostgres() bool {
+	return dialect == "postgres"
+}
+
+func IsSQLite() bool {
+	return dialect == "sqlite"
+}
+
 // IsNotFound checks if the given error is a GORM record not found error.
 func IsNotFound(err error) bool {
 	return err == gorm.ErrRecordNotFound
@@ -193,6 +230,9 @@ func IsSQLiteDB(file io.ReaderAt) (bool, error) {
 
 // Checkpoint performs a WAL checkpoint on the SQLite database to ensure data consistency.
 func Checkpoint() error {
+	if !IsSQLite() {
+		return nil
+	}
 	// Update WAL
 	err := db.Exec("PRAGMA wal_checkpoint;").Error
 	if err != nil {
@@ -205,6 +245,9 @@ func Checkpoint() error {
 // and runs a PRAGMA integrity_check to ensure the file is structurally sound.
 // It does not mutate global state or run migrations.
 func ValidateSQLiteDB(dbPath string) error {
+	if !IsSQLite() {
+		return errors.New("sqlite validation is only available for sqlite databases")
+	}
 	if _, err := os.Stat(dbPath); err != nil { // file must exist
 		return err
 	}

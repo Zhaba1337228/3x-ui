@@ -30,6 +30,56 @@ bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.
 
 For full documentation, please visit the [project Wiki](https://github.com/MHSanaei/3x-ui/wiki).
 
+## PostgreSQL Setup
+
+The panel now supports both `sqlite` and `postgres`.
+
+### Systemd install
+
+The packaged systemd units already load environment files:
+
+- Debian/Ubuntu: `/etc/default/x-ui`
+- RHEL/CentOS/Alma/Rocky: `/etc/sysconfig/x-ui`
+
+Example:
+
+```bash
+cat >/etc/default/x-ui <<'EOF'
+XRAY_VMESS_AEAD_FORCED=false
+XUI_DB_DRIVER=postgres
+XUI_POSTGRES_DSN=host=127.0.0.1 port=5432 user=xui password=change_me dbname=xui sslmode=disable TimeZone=UTC
+XUI_DB_MAX_IDLE_CONNS=10
+XUI_DB_MAX_OPEN_CONNS=50
+EOF
+
+systemctl daemon-reload
+systemctl restart x-ui
+systemctl status x-ui
+```
+
+Minimal PostgreSQL bootstrap on the server:
+
+```bash
+sudo -u postgres psql <<'SQL'
+CREATE USER xui WITH PASSWORD 'change_me';
+CREATE DATABASE xui OWNER xui;
+SQL
+```
+
+### Docker Compose install
+
+1. Copy `.env.example` to `.env`
+2. Set:
+   - `XUI_DB_DRIVER=postgres`
+   - `XUI_POSTGRES_DSN=host=127.0.0.1 port=5432 user=xui password=change_me dbname=xui sslmode=disable TimeZone=UTC`
+3. Start Postgres profile and panel:
+
+```bash
+docker compose --profile postgres up -d --build
+```
+
+If you keep `XUI_DB_DRIVER=sqlite`, Postgres is not required and the panel continues using the local DB file.
+
 ## A Special Thanks to
 
 - [alireza0](https://github.com/alireza0/)

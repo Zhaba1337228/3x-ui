@@ -103,6 +103,209 @@ install_base() {
     esac
 }
 
+get_xui_env_file() {
+    case "${release}" in
+        alpine)
+            echo "/etc/conf.d/x-ui"
+        ;;
+        ubuntu | debian | armbian)
+            echo "/etc/default/x-ui"
+        ;;
+        *)
+            echo "/etc/sysconfig/x-ui"
+        ;;
+    esac
+}
+
+upsert_env_var() {
+    local file="$1"
+    local key="$2"
+    local value="$3"
+
+    mkdir -p "$(dirname "$file")"
+    touch "$file"
+
+    if grep -q "^${key}=" "$file" 2>/dev/null; then
+        sed -i "s#^${key}=.*#${key}=${value}#g" "$file"
+    else
+        echo "${key}=${value}" >> "$file"
+    fi
+}
+
+install_postgres_local() {
+    case "${release}" in
+        ubuntu | debian | armbian)
+            apt-get update && apt-get install -y -q postgresql postgresql-contrib
+            systemctl enable postgresql >/dev/null 2>&1
+            systemctl start postgresql >/dev/null 2>&1
+        ;;
+        fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
+            dnf install -y -q postgresql-server postgresql-contrib
+            postgresql-setup --initdb >/dev/null 2>&1 || true
+            systemctl enable postgresql >/dev/null 2>&1
+            systemctl start postgresql >/dev/null 2>&1
+        ;;
+        centos)
+            if [[ "${VERSION_ID}" =~ ^7 ]]; then
+                yum install -y postgresql-server postgresql-contrib
+                postgresql-setup initdb >/dev/null 2>&1 || true
+            else
+                dnf install -y -q postgresql-server postgresql-contrib
+                postgresql-setup --initdb >/dev/null 2>&1 || true
+            fi
+            systemctl enable postgresql >/dev/null 2>&1
+            systemctl start postgresql >/dev/null 2>&1
+        ;;
+        arch | manjaro | parch)
+            pacman -Sy --noconfirm postgresql
+            su - postgres -c "initdb -D /var/lib/postgres/data" >/dev/null 2>&1 || true
+            systemctl enable postgresql >/dev/null 2>&1
+            systemctl start postgresql >/dev/null 2>&1
+        ;;
+        alpine)
+            apk add --no-cache postgresql postgresql-client
+            rc-update add postgresql default >/dev/null 2>&1 || true
+            rc-service postgresql start >/dev/null 2>&1 || true
+        ;;
+        *)
+            echo -e "${red}Automatic local PostgreSQL install is not supported on this OS yet.${plain}"
+            return 1
+        ;;
+    esac
+    return 0
+}
+
+bootstrap_local_postgres() {
+    local db_name="$1"
+    local db_user="$2"
+    local db_password="$3"
+
+    local sql="
+DO \$\$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${db_user}') THEN
+      CREATE ROLE ${db_user} LOGIN PASSWORD '${db_password}';
+   ELSE
+      ALTER ROLE ${db_user} WITH LOGIN PASSWORD '${db_password}';
+   END IF;
+END
+\$\$;
+"
+
+    local db_sql="
+DO \$\$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_database WHERE datname = '${db_name}') THEN
+      CREATE DATABASE ${db_name} OWNER ${db_user};
+   END IF;
+END
+\$\$;
+"
+
+    if id postgres >/dev/null 2>&1; then
+        su - postgres -c "psql -v ON_ERROR_STOP=1 -d postgres -c \"${sql}\"" || return 1
+        su - postgres -c "psql -v ON_ERROR_STOP=1 -d postgres -c \"${db_sql}\"" || return 1
+    else
+        psql -U postgres -v ON_ERROR_STOP=1 -d postgres -c "${sql}" || return 1
+        psql -U postgres -v ON_ERROR_STOP=1 -d postgres -c "${db_sql}" || return 1
+    fi
+
+    return 0
+}
+
+configure_database_env() {
+    local env_file
+    env_file=$(get_xui_env_file)
+
+    local existing_driver=""
+    if [[ -f "${env_file}" ]]; then
+        existing_driver=$(grep '^XUI_DB_DRIVER=' "${env_file}" | tail -n1 | cut -d= -f2)
+    fi
+    [[ -z "${existing_driver}" ]] && existing_driver="sqlite"
+
+    echo ""
+    echo -e "${green}Database backend setup${plain}"
+    echo -e "${green}1.${plain} SQLite (default, old behavior)"
+    echo -e "${green}2.${plain} PostgreSQL"
+
+    local default_choice="1"
+    [[ "${existing_driver}" == "postgres" ]] && default_choice="2"
+
+    local db_choice=""
+    read -rp "Choose database backend [default ${default_choice}]: " db_choice
+    db_choice="${db_choice:-$default_choice}"
+
+    if [[ "${db_choice}" != "2" ]]; then
+        upsert_env_var "${env_file}" "XUI_DB_DRIVER" "sqlite"
+        upsert_env_var "${env_file}" "XUI_POSTGRES_DSN" ""
+        export XUI_DB_DRIVER="sqlite"
+        unset XUI_POSTGRES_DSN
+        echo -e "${green}SQLite selected.${plain}"
+        return 0
+    fi
+
+    local pg_mode=""
+    echo -e "${green}1.${plain} Install PostgreSQL on this server"
+    echo -e "${green}2.${plain} Use external PostgreSQL"
+    read -rp "Choose PostgreSQL mode [default 1]: " pg_mode
+    pg_mode="${pg_mode:-1}"
+
+    local pg_host="127.0.0.1"
+    local pg_port="5432"
+    local pg_db="xui"
+    local pg_user="xui"
+    local pg_password=""
+    local pg_sslmode="disable"
+
+    if [[ "${pg_mode}" == "1" ]]; then
+        read -rp "PostgreSQL port [default 5432]: " pg_port
+        pg_port="${pg_port:-5432}"
+        read -rp "Database name [default xui]: " pg_db
+        pg_db="${pg_db:-xui}"
+        read -rp "Database user [default xui]: " pg_user
+        pg_user="${pg_user:-xui}"
+        read -rp "Database password [leave empty to generate]: " pg_password
+        [[ -z "${pg_password}" ]] && pg_password=$(gen_random_string 24)
+
+        echo -e "${yellow}Installing/configuring local PostgreSQL...${plain}"
+        install_postgres_local || return 1
+        bootstrap_local_postgres "${pg_db}" "${pg_user}" "${pg_password}" || return 1
+    else
+        read -rp "PostgreSQL host [default 127.0.0.1]: " pg_host
+        pg_host="${pg_host:-127.0.0.1}"
+        read -rp "PostgreSQL port [default 5432]: " pg_port
+        pg_port="${pg_port:-5432}"
+        read -rp "Database name [default xui]: " pg_db
+        pg_db="${pg_db:-xui}"
+        read -rp "Database user [default xui]: " pg_user
+        pg_user="${pg_user:-xui}"
+        read -rp "Database password: " pg_password
+        read -rp "SSL mode [default disable]: " pg_sslmode
+        pg_sslmode="${pg_sslmode:-disable}"
+    fi
+
+    local dsn="host=${pg_host} port=${pg_port} user=${pg_user} password=${pg_password} dbname=${pg_db} sslmode=${pg_sslmode} TimeZone=UTC"
+
+    upsert_env_var "${env_file}" "XUI_DB_DRIVER" "postgres"
+    upsert_env_var "${env_file}" "XUI_POSTGRES_DSN" "\"${dsn}\""
+    upsert_env_var "${env_file}" "XUI_DB_MAX_IDLE_CONNS" "10"
+    upsert_env_var "${env_file}" "XUI_DB_MAX_OPEN_CONNS" "50"
+
+    export XUI_DB_DRIVER="postgres"
+    export XUI_POSTGRES_DSN="${dsn}"
+    export XUI_DB_MAX_IDLE_CONNS="10"
+    export XUI_DB_MAX_OPEN_CONNS="50"
+
+    echo -e "${green}PostgreSQL configuration saved to ${env_file}${plain}"
+    echo -e "${green}Database: ${pg_db}${plain}"
+    echo -e "${green}User: ${pg_user}${plain}"
+    echo -e "${green}Host: ${pg_host}:${pg_port}${plain}"
+    if [[ "${pg_mode}" == "1" ]]; then
+        echo -e "${yellow}Generated/used DB password: ${pg_password}${plain}"
+    fi
+    return 0
+}
+
 gen_random_string() {
     local length="$1"
     local random_string=$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | fold -w "$length" | head -n 1)
@@ -833,6 +1036,11 @@ install_x-ui() {
     mv -f /usr/bin/x-ui-temp /usr/bin/x-ui
     chmod +x /usr/bin/x-ui
     mkdir -p /var/log/x-ui
+    configure_database_env
+    if [[ $? -ne 0 ]]; then
+        echo -e "${red}Database configuration failed.${plain}"
+        exit 1
+    fi
     config_after_install
 
     # Etckeeper compatibility

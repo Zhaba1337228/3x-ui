@@ -882,6 +882,9 @@ func (s *ServerService) GetConfigJson() (any, error) {
 }
 
 func (s *ServerService) GetDb() ([]byte, error) {
+	if !database.IsSQLite() {
+		return nil, common.NewError("database file export is only supported for sqlite")
+	}
 	// Update by manually trigger a checkpoint operation
 	err := database.Checkpoint()
 	if err != nil {
@@ -904,6 +907,9 @@ func (s *ServerService) GetDb() ([]byte, error) {
 }
 
 func (s *ServerService) ImportDB(file multipart.File) error {
+	if !database.IsSQLite() {
+		return common.NewError("database file import is only supported for sqlite")
+	}
 	// Check if the file is a SQLite database
 	isValidDb, err := database.IsSQLiteDB(file)
 	if err != nil {

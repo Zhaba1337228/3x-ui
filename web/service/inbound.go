@@ -142,15 +142,21 @@ func (s *InboundService) GetClients(inbound *model.Inbound) ([]model.Client, err
 }
 
 func (s *InboundService) getAllEmails() ([]string, error) {
-	db := database.GetDB()
-	var emails []string
-	err := db.Raw(`
-		SELECT JSON_EXTRACT(client.value, '$.email')
-		FROM inbounds,
-			JSON_EACH(JSON_EXTRACT(inbounds.settings, '$.clients')) AS client
-		`).Scan(&emails).Error
+	inbounds, err := s.GetAllInbounds()
 	if err != nil {
 		return nil, err
+	}
+	emails := make([]string, 0)
+	for _, inbound := range inbounds {
+		clients, err := s.GetClients(inbound)
+		if err != nil {
+			return nil, err
+		}
+		for _, client := range clients {
+			if client.Email != "" {
+				emails = append(emails, client.Email)
+			}
+		}
 	}
 	return emails, nil
 }
@@ -1312,14 +1318,16 @@ func (s *InboundService) GetInboundTags() (string, error) {
 
 func (s *InboundService) MigrationRemoveOrphanedTraffics() {
 	db := database.GetDB()
-	db.Exec(`
-		DELETE FROM client_traffics
-		WHERE email NOT IN (
-			SELECT JSON_EXTRACT(client.value, '$.email')
-			FROM inbounds,
-				JSON_EACH(JSON_EXTRACT(inbounds.settings, '$.clients')) AS client
-		)
-	`)
+	emails, err := s.getAllEmails()
+	if err != nil {
+		logger.Warningf("failed to load inbound emails for orphan cleanup: %v", err)
+		return
+	}
+	if len(emails) == 0 {
+		db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&xray.ClientTraffic{})
+		return
+	}
+	db.Where("email NOT IN ?", emails).Delete(&xray.ClientTraffic{})
 }
 
 func (s *InboundService) AddClientStat(tx *gorm.DB, inboundId int, client *model.Client) error {
@@ -1911,19 +1919,25 @@ func (s *InboundService) DelDepletedClients(id int) (err error) {
 
 	// Only consider truly depleted clients: expired OR traffic exhausted
 	now := time.Now().Unix() * 1000
-	depletedClients := []xray.ClientTraffic{}
+	var depletedRows []xray.ClientTraffic
 	err = db.Model(xray.ClientTraffic{}).
 		Where(whereText+" and ((total > 0 and up + down >= total) or (expiry_time > 0 and expiry_time <= ?))", id, now).
-		Select("inbound_id, GROUP_CONCAT(email) as email").
-		Group("inbound_id").
-		Find(&depletedClients).Error
+		Select("inbound_id, email").
+		Find(&depletedRows).Error
 	if err != nil {
 		return err
 	}
 
-	for _, depletedClient := range depletedClients {
-		emails := strings.Split(depletedClient.Email, ",")
-		oldInbound, err := s.GetInbound(depletedClient.InboundId)
+	depletedClients := make(map[int][]string)
+	for _, row := range depletedRows {
+		if row.Email == "" {
+			continue
+		}
+		depletedClients[row.InboundId] = append(depletedClients[row.InboundId], row.Email)
+	}
+
+	for inboundID, emails := range depletedClients {
+		oldInbound, err := s.GetInbound(inboundID)
 		if err != nil {
 			return err
 		}
@@ -1963,7 +1977,9 @@ func (s *InboundService) DelDepletedClients(id int) (err error) {
 			}
 		} else {
 			// Delete inbound if no client remains
-			s.DelInbound(depletedClient.InboundId)
+			if _, err := s.DelInbound(inboundID); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -2058,14 +2074,27 @@ func (s *InboundService) UpdateClientTrafficByEmail(email string, upload int64, 
 func (s *InboundService) GetClientTrafficByID(id string) ([]xray.ClientTraffic, error) {
 	db := database.GetDB()
 	var traffics []xray.ClientTraffic
-
-	err := db.Model(xray.ClientTraffic{}).Where(`email IN(
-		SELECT JSON_EXTRACT(client.value, '$.email') as email
-		FROM inbounds,
-	  	JSON_EACH(JSON_EXTRACT(inbounds.settings, '$.clients')) AS client
-		WHERE
-	  	JSON_EXTRACT(client.value, '$.id') in (?)
-		)`, id).Find(&traffics).Error
+	inbounds, err := s.GetAllInbounds()
+	if err != nil {
+		logger.Debug(err)
+		return nil, err
+	}
+	emails := make([]string, 0)
+	for _, inbound := range inbounds {
+		clients, err := s.GetClients(inbound)
+		if err != nil {
+			return nil, err
+		}
+		for _, client := range clients {
+			if client.ID == id && client.Email != "" {
+				emails = append(emails, client.Email)
+			}
+		}
+	}
+	if len(emails) == 0 {
+		return []xray.ClientTraffic{}, nil
+	}
+	err = db.Model(xray.ClientTraffic{}).Where("email IN ?", emails).Find(&traffics).Error
 
 	if err != nil {
 		logger.Debug(err)
@@ -2084,39 +2113,32 @@ func (s *InboundService) GetClientTrafficByID(id string) ([]xray.ClientTraffic, 
 
 func (s *InboundService) SearchClientTraffic(query string) (traffic *xray.ClientTraffic, err error) {
 	db := database.GetDB()
-	inbound := &model.Inbound{}
 	traffic = &xray.ClientTraffic{}
-
-	// Search for inbound settings that contain the query
-	err = db.Model(model.Inbound{}).Where("settings LIKE ?", "%\""+query+"\"%").First(inbound).Error
+	inbounds, err := s.GetAllInbounds()
 	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			logger.Warningf("Inbound settings containing query %s not found: %v", query, err)
+		logger.Errorf("Error loading inbounds for query %s: %v", query, err)
+		return nil, err
+	}
+
+	for _, inbound := range inbounds {
+		clients, err := s.GetClients(inbound)
+		if err != nil {
 			return nil, err
 		}
-		logger.Errorf("Error searching for inbound settings with query %s: %v", query, err)
-		return nil, err
-	}
-
-	traffic.InboundId = inbound.Id
-
-	// Unmarshal settings to get clients
-	settings := map[string][]model.Client{}
-	if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
-		logger.Errorf("Error unmarshalling inbound settings for inbound ID %d: %v", inbound.Id, err)
-		return nil, err
-	}
-
-	clients := settings["clients"]
-	for _, client := range clients {
-		if (client.ID == query || client.Password == query) && client.Email != "" {
-			traffic.Email = client.Email
+		for _, client := range clients {
+			if (client.ID == query || client.Password == query) && client.Email != "" {
+				traffic.InboundId = inbound.Id
+				traffic.Email = client.Email
+				break
+			}
+		}
+		if traffic.Email != "" {
 			break
 		}
 	}
 
 	if traffic.Email == "" {
-		logger.Warningf("No client found with query %s in inbound ID %d", query, inbound.Id)
+		logger.Warningf("No client found with query %s", query)
 		return nil, gorm.ErrRecordNotFound
 	}
 
@@ -2211,8 +2233,10 @@ func (s *InboundService) MigrationRequirements() {
 	defer func() {
 		if err == nil {
 			tx.Commit()
-			if dbErr := db.Exec(`VACUUM "main"`).Error; dbErr != nil {
-				logger.Warningf("VACUUM failed: %v", dbErr)
+			if database.IsSQLite() {
+				if dbErr := db.Exec(`VACUUM "main"`).Error; dbErr != nil {
+					logger.Warningf("VACUUM failed: %v", dbErr)
+				}
 			}
 		} else {
 			tx.Rollback()
@@ -2222,16 +2246,16 @@ func (s *InboundService) MigrationRequirements() {
 	// Calculate and backfill all_time from up+down for inbounds and clients
 	err = tx.Exec(`
 		UPDATE inbounds
-		SET all_time = IFNULL(up, 0) + IFNULL(down, 0)
-		WHERE IFNULL(all_time, 0) = 0 AND (IFNULL(up, 0) + IFNULL(down, 0)) > 0
+		SET all_time = COALESCE(up, 0) + COALESCE(down, 0)
+		WHERE COALESCE(all_time, 0) = 0 AND (COALESCE(up, 0) + COALESCE(down, 0)) > 0
 	`).Error
 	if err != nil {
 		return
 	}
 	err = tx.Exec(`
 		UPDATE client_traffics
-		SET all_time = IFNULL(up, 0) + IFNULL(down, 0)
-		WHERE IFNULL(all_time, 0) = 0 AND (IFNULL(up, 0) + IFNULL(down, 0)) > 0
+		SET all_time = COALESCE(up, 0) + COALESCE(down, 0)
+		WHERE COALESCE(all_time, 0) = 0 AND (COALESCE(up, 0) + COALESCE(down, 0)) > 0
 	`).Error
 
 	if err != nil {
@@ -2313,50 +2337,60 @@ func (s *InboundService) MigrationRequirements() {
 	tx.Where("inbound_id = 0").Delete(xray.ClientTraffic{})
 
 	// Migrate old MultiDomain to External Proxy
-	var externalProxy []struct {
-		Id             int
-		Port           int
-		StreamSettings []byte
-	}
-	err = tx.Raw(`select id, port, stream_settings
-	from inbounds
-	WHERE protocol in ('vmess','vless','trojan')
-	  AND json_extract(stream_settings, '$.security') = 'tls'
-	  AND json_extract(stream_settings, '$.tlsSettings.settings.domains') IS NOT NULL`).Scan(&externalProxy).Error
-	if err != nil || len(externalProxy) == 0 {
+	var proxyCandidates []*model.Inbound
+	err = tx.Model(model.Inbound{}).Select("id", "port", "stream_settings", "protocol").Where("protocol IN ?", []string{"vmess", "vless", "trojan"}).Find(&proxyCandidates).Error
+	if err != nil && err != gorm.ErrRecordNotFound {
 		return
 	}
 
-	for _, ep := range externalProxy {
+	for _, ep := range proxyCandidates {
 		var reverses any
 		var stream map[string]any
-		json.Unmarshal(ep.StreamSettings, &stream)
-		if tlsSettings, ok := stream["tlsSettings"].(map[string]any); ok {
-			if settings, ok := tlsSettings["settings"].(map[string]any); ok {
-				if domains, ok := settings["domains"].([]any); ok {
-					for _, domain := range domains {
-						if domainMap, ok := domain.(map[string]any); ok {
-							domainMap["forceTls"] = "same"
-							domainMap["port"] = ep.Port
-							domainMap["dest"] = domainMap["domain"].(string)
-							delete(domainMap, "domain")
-						}
-					}
+		if err := json.Unmarshal([]byte(ep.StreamSettings), &stream); err != nil || stream == nil {
+			continue
+		}
+		if stream["security"] != "tls" {
+			continue
+		}
+		tlsSettings, ok := stream["tlsSettings"].(map[string]any)
+		if !ok {
+			continue
+		}
+		settings, ok := tlsSettings["settings"].(map[string]any)
+		if !ok {
+			continue
+		}
+		domains, ok := settings["domains"].([]any)
+		if !ok || len(domains) == 0 {
+			continue
+		}
+		for _, domain := range domains {
+			if domainMap, ok := domain.(map[string]any); ok {
+				if domainName, ok := domainMap["domain"].(string); ok {
+					domainMap["forceTls"] = "same"
+					domainMap["port"] = ep.Port
+					domainMap["dest"] = domainName
+					delete(domainMap, "domain")
 				}
-				reverses = settings["domains"]
-				delete(settings, "domains")
 			}
 		}
+		reverses = settings["domains"]
+		delete(settings, "domains")
 		stream["externalProxy"] = reverses
 		newStream, _ := json.MarshalIndent(stream, " ", "  ")
 		tx.Model(model.Inbound{}).Where("id = ?", ep.Id).Update("stream_settings", newStream)
 	}
 
-	err = tx.Raw(`UPDATE inbounds
-	SET tag = REPLACE(tag, '0.0.0.0:', '')
-	WHERE INSTR(tag, '0.0.0.0:') > 0;`).Error
-	if err != nil {
+	var tagsToFix []*model.Inbound
+	err = tx.Model(model.Inbound{}).Select("id", "tag").Where("tag LIKE ?", "%0.0.0.0:%").Find(&tagsToFix).Error
+	if err != nil && err != gorm.ErrRecordNotFound {
 		return
+	}
+	for _, inbound := range tagsToFix {
+		inbound.Tag = strings.ReplaceAll(inbound.Tag, "0.0.0.0:", "")
+		if err = tx.Model(model.Inbound{}).Where("id = ?", inbound.Id).Update("tag", inbound.Tag).Error; err != nil {
+			return
+		}
 	}
 }
 

@@ -3656,6 +3656,11 @@ func (t *Tgbot) sendBackup(chatId int64) {
 	output := t.I18nBot("tgbot.messages.backupTime", "Time=="+time.Now().Format("2006-01-02 15:04:05"))
 	t.SendMsgToTgbot(chatId, output)
 
+	if !database.IsSQLite() {
+		t.SendMsgToTgbot(chatId, "Database file backup is unavailable when the panel uses Postgres.")
+		return
+	}
+
 	// Update by manually trigger a checkpoint operation
 	err := database.Checkpoint()
 	if err != nil {

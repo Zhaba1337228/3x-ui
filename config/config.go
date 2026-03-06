@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -98,6 +99,41 @@ func GetDBFolderPath() string {
 // GetDBPath returns the full path to the database file.
 func GetDBPath() string {
 	return fmt.Sprintf("%s/%s.db", GetDBFolderPath(), GetName())
+}
+
+// GetDBDriver returns the configured database backend. Supported values:
+// "sqlite" (default) and "postgres".
+func GetDBDriver() string {
+	driver := strings.ToLower(strings.TrimSpace(os.Getenv("XUI_DB_DRIVER")))
+	if driver == "" {
+		return "sqlite"
+	}
+	return driver
+}
+
+// GetPostgresDSN returns the Postgres connection string.
+func GetPostgresDSN() string {
+	return strings.TrimSpace(os.Getenv("XUI_POSTGRES_DSN"))
+}
+
+func getEnvInt(name string, defaultValue int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return defaultValue
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return defaultValue
+	}
+	return value
+}
+
+func GetDBMaxIdleConns() int {
+	return getEnvInt("XUI_DB_MAX_IDLE_CONNS", 10)
+}
+
+func GetDBMaxOpenConns() int {
+	return getEnvInt("XUI_DB_MAX_OPEN_CONNS", 50)
 }
 
 // GetLogFolder returns the path to the log folder based on environment variables or platform defaults.
