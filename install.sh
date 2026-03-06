@@ -132,7 +132,7 @@ choose_postgres_port() {
         selected_port="${selected_port:-${default_port}}"
 
         if ! [[ "${selected_port}" =~ ^[0-9]+$ ]] || ((selected_port < 1 || selected_port > 65535)); then
-            echo -e "${red}Invalid PostgreSQL port. Choose a number between 1 and 65535.${plain}"
+            echo -e "${red}Invalid PostgreSQL port. Choose a number between 1 and 65535.${plain}" >&2
             continue
         fi
 
@@ -140,17 +140,17 @@ choose_postgres_port() {
             local cluster_status=""
             cluster_status=$(postgres_cluster_status_on_port "${selected_port}" 2>/dev/null || true)
             if [[ "${cluster_status}" == "online" ]]; then
-                echo -e "${green}Existing PostgreSQL cluster already uses port ${selected_port}. Will reuse it.${plain}"
+                echo -e "${green}Existing PostgreSQL cluster already uses port ${selected_port}. Will reuse it.${plain}" >&2
             else
-                echo -e "${yellow}PostgreSQL cluster is configured for port ${selected_port} but is not running. Installer will recover or move it automatically if needed.${plain}"
+                echo -e "${yellow}PostgreSQL cluster is configured for port ${selected_port} but is not running. Installer will recover or move it automatically if needed.${plain}" >&2
             fi
             echo "${selected_port}"
             return 0
         fi
 
         if is_port_in_use "${selected_port}"; then
-            echo -e "${red}Port ${selected_port} is already occupied. Choose another port.${plain}"
-            echo -e "${yellow}Listener:${plain} $(get_listening_process_for_port "${selected_port}")"
+            echo -e "${red}Port ${selected_port} is already occupied. Choose another port.${plain}" >&2
+            echo -e "${yellow}Listener:${plain} $(get_listening_process_for_port "${selected_port}")" >&2
             continue
         fi
 
