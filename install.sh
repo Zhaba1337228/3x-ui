@@ -133,11 +133,20 @@ upsert_env_var() {
 }
 
 install_postgres_local() {
+    local pg_port="${1:-5432}"
     case "${release}" in
         ubuntu | debian | armbian)
             apt-get update && apt-get install -y -q postgresql postgresql-contrib
             systemctl enable postgresql >/dev/null 2>&1
             systemctl start postgresql >/dev/null 2>&1
+            if command -v pg_lsclusters >/dev/null 2>&1; then
+                local cluster_ver cluster_name
+                cluster_ver=$(pg_lsclusters --no-header 2>/dev/null | awk 'NR==1{print $1}')
+                cluster_name=$(pg_lsclusters --no-header 2>/dev/null | awk 'NR==1{print $2}')
+                if [[ -n "${cluster_ver}" && -n "${cluster_name}" ]]; then
+                    pg_ctlcluster "${cluster_ver}" "${cluster_name}" start >/dev/null 2>&1 || true
+                fi
+            fi
         ;;
         fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
             dnf install -y -q postgresql-server postgresql-contrib
@@ -172,6 +181,22 @@ install_postgres_local() {
             return 1
         ;;
     esac
+
+    if command -v pg_isready >/dev/null 2>&1; then
+        local ready=0
+        for _ in $(seq 1 15); do
+            if pg_isready -h 127.0.0.1 -p "${pg_port}" >/dev/null 2>&1 || pg_isready >/dev/null 2>&1; then
+                ready=1
+                break
+            fi
+            sleep 1
+        done
+        if [[ "${ready}" != "1" ]]; then
+            echo -e "${red}PostgreSQL did not become ready in time.${plain}"
+            return 1
+        fi
+    fi
+
     return 0
 }
 
@@ -317,10 +342,13 @@ configure_database_env() {
         read -rp "Database user [default xui]: " pg_user
         pg_user="${pg_user:-xui}"
         read -rp "Database password [leave empty to generate]: " pg_password
-        [[ -z "${pg_password}" ]] && pg_password=$(gen_random_string 24)
+        if [[ -z "${pg_password}" ]]; then
+            pg_password=$(gen_random_string 24)
+            echo -e "${yellow}Generated PostgreSQL password: ${pg_password}${plain}"
+        fi
 
         echo -e "${yellow}Installing/configuring local PostgreSQL...${plain}"
-        install_postgres_local || return 1
+        install_postgres_local "${pg_port}" || return 1
         configure_local_postgres_security "${pg_port}"
         pg_host="127.0.0.1"
         pg_sslmode="disable"
