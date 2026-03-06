@@ -5,6 +5,7 @@ green='\033[0;32m'
 blue='\033[0;34m'
 yellow='\033[0;33m'
 plain='\033[0m'
+XUI_EFFECTIVE_PG_PORT=""
 
 cur_dir=$(pwd)
 
@@ -343,11 +344,14 @@ prepare_local_postgres_port() {
 
 configure_local_postgres_security() {
     local pg_port="$1"
+    local requested_port="$1"
     local pg_conf=""
     local pg_hba=""
     local cluster_ver=""
     local cluster_name=""
     local cluster_info=""
+
+    XUI_EFFECTIVE_PG_PORT="${pg_port}"
 
     cluster_info=$(get_primary_postgres_cluster)
     if [[ -n "${cluster_info}" ]]; then
@@ -404,7 +408,32 @@ EOF
     else
         systemctl restart postgresql >/dev/null 2>&1 || rc-service postgresql restart >/dev/null 2>&1 || true
     fi
-    ensure_postgres_running "${pg_port}" || return 1
+    if ensure_postgres_running "${pg_port}"; then
+        XUI_EFFECTIVE_PG_PORT="${pg_port}"
+        return 0
+    fi
+
+    local fallback_port=""
+    fallback_port=$(find_free_port 1024 65535) || return 1
+    if [[ "${fallback_port}" == "${requested_port}" ]]; then
+        return 1
+    fi
+
+    echo -e "${yellow}PostgreSQL cluster did not start on port ${requested_port}. Retrying with port ${fallback_port}.${plain}"
+
+    if [[ -n "${pg_conf}" ]]; then
+        sed -i "s/^#\?port *=.*/port = ${fallback_port}/" "${pg_conf}" 2>/dev/null || true
+    fi
+
+    if [[ -n "${cluster_ver}" && -n "${cluster_name}" ]] && command -v pg_ctlcluster >/dev/null 2>&1; then
+        pg_ctlcluster "${cluster_ver}" "${cluster_name}" restart >/dev/null 2>&1 || pg_ctlcluster "${cluster_ver}" "${cluster_name}" start >/dev/null 2>&1 || true
+    else
+        systemctl restart postgresql >/dev/null 2>&1 || rc-service postgresql restart >/dev/null 2>&1 || true
+    fi
+
+    ensure_postgres_running "${fallback_port}" || return 1
+    XUI_EFFECTIVE_PG_PORT="${fallback_port}"
+    return 0
 }
 
 bootstrap_local_postgres() {
@@ -526,6 +555,7 @@ configure_database_env() {
         install_postgres_local || return 1
         pg_port=$(prepare_local_postgres_port "${pg_port}") || return 1
         configure_local_postgres_security "${pg_port}" || return 1
+        pg_port="${XUI_EFFECTIVE_PG_PORT:-${pg_port}}"
         pg_host="127.0.0.1"
         pg_sslmode="disable"
         if id postgres >/dev/null 2>&1; then
