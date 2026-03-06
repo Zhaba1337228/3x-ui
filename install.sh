@@ -200,6 +200,39 @@ install_postgres_local() {
     return 0
 }
 
+ensure_postgres_running() {
+    local pg_port="${1:-5432}"
+
+    if command -v pg_lsclusters >/dev/null 2>&1 && command -v pg_ctlcluster >/dev/null 2>&1; then
+        while read -r ver name _; do
+            [[ -z "${ver}" || -z "${name}" ]] && continue
+            pg_ctlcluster "${ver}" "${name}" start >/dev/null 2>&1 || true
+        done < <(pg_lsclusters --no-header 2>/dev/null | awk '{print $1" "$2" "$4}')
+    fi
+
+    systemctl start postgresql >/dev/null 2>&1 || rc-service postgresql start >/dev/null 2>&1 || true
+
+    if command -v pg_isready >/dev/null 2>&1; then
+        for _ in $(seq 1 20); do
+            if pg_isready -h 127.0.0.1 -p "${pg_port}" >/dev/null 2>&1; then
+                return 0
+            fi
+            sleep 1
+        done
+    fi
+
+    if ss -ltn 2>/dev/null | grep -q ":${pg_port}[[:space:]]"; then
+        return 0
+    fi
+
+    echo -e "${red}PostgreSQL is still not running on 127.0.0.1:${pg_port}.${plain}"
+    if command -v pg_lsclusters >/dev/null 2>&1; then
+        echo -e "${yellow}Current clusters:${plain}"
+        pg_lsclusters || true
+    fi
+    return 1
+}
+
 configure_local_postgres_security() {
     local pg_port="$1"
     local pg_conf=""
@@ -242,12 +275,16 @@ EOF
     fi
 
     systemctl restart postgresql >/dev/null 2>&1 || rc-service postgresql restart >/dev/null 2>&1 || true
+    ensure_postgres_running "${pg_port}" || return 1
 }
 
 bootstrap_local_postgres() {
     local db_name="$1"
     local db_user="$2"
     local db_password="$3"
+    local pg_port="${4:-5432}"
+
+    ensure_postgres_running "${pg_port}" || return 1
 
     if id postgres >/dev/null 2>&1; then
         su - postgres -c "psql -v ON_ERROR_STOP=1 -d postgres" <<SQL || return 1
@@ -352,7 +389,7 @@ configure_database_env() {
         configure_local_postgres_security "${pg_port}"
         pg_host="127.0.0.1"
         pg_sslmode="disable"
-        bootstrap_local_postgres "${pg_db}" "${pg_user}" "${pg_password}" || return 1
+        bootstrap_local_postgres "${pg_db}" "${pg_user}" "${pg_password}" "${pg_port}" || return 1
     else
         read -rp "PostgreSQL host [default 127.0.0.1]: " pg_host
         pg_host="${pg_host:-127.0.0.1}"
