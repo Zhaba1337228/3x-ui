@@ -1067,6 +1067,23 @@ func (s *ServerService) importJSONBackup(file multipart.File) error {
 	return s.restoreBackupToCurrentDB(backup)
 }
 
+func (s *ServerService) saveUploadToTemp(file multipart.File, pattern string) (string, error) {
+	tempFile, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", common.NewErrorf("Error creating temporary upload file: %v", err)
+	}
+	defer tempFile.Close()
+
+	if _, err := file.Seek(0, 0); err != nil {
+		return "", common.NewErrorf("Error resetting uploaded file: %v", err)
+	}
+	if _, err := io.Copy(tempFile, file); err != nil {
+		return "", common.NewErrorf("Error saving uploaded file: %v", err)
+	}
+
+	return tempFile.Name(), nil
+}
+
 func (s *ServerService) GetDb() ([]byte, string, error) {
 	if !database.IsSQLite() {
 		backup, err := s.buildDatabaseBackup(database.GetDB(), database.GetDialect())
@@ -1105,31 +1122,44 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 		logger.Warningf("Failed to stop Xray before DB import: %v", errStop)
 	}
 
-	// Check if the file is a SQLite database
-	isValidDb, err := database.IsSQLiteDB(file)
+	tempPath, err := s.saveUploadToTemp(file, "x-ui-upload-*")
 	if err != nil {
-		return common.NewErrorf("Error checking db file format: %v", err)
+		return err
 	}
-	if !isValidDb {
-		_, err = file.Seek(0, 0)
-		if err != nil {
-			return common.NewErrorf("Error resetting file reader: %v", err)
-		}
-		return s.importJSONBackup(file)
-	}
+	defer os.Remove(tempPath)
 
-	// Reset the file reader to the beginning
-	_, err = file.Seek(0, 0)
+	tempReader, err := os.Open(tempPath)
 	if err != nil {
-		return common.NewErrorf("Error resetting file reader: %v", err)
+		return common.NewErrorf("Error opening temporary upload file: %v", err)
+	}
+	defer tempReader.Close()
+
+	// Check if the file is a SQLite database
+	isValidDb, err := database.IsSQLiteDB(tempReader)
+	if err != nil {
+		// Non-SQLite backups are allowed; try JSON import below.
+		isValidDb = false
 	}
 
 	if database.IsPostgres() {
-		return s.importSQLiteIntoCurrentDB(file)
+		if isValidDb {
+			return s.importSQLiteIntoCurrentDB(tempReader)
+		}
+		if _, err := tempReader.Seek(0, 0); err != nil {
+			return common.NewErrorf("Error resetting temporary upload file: %v", err)
+		}
+		return s.importJSONBackup(tempReader)
+	}
+
+	if !isValidDb {
+		if _, err := tempReader.Seek(0, 0); err != nil {
+			return common.NewErrorf("Error resetting temporary upload file: %v", err)
+		}
+		return s.importJSONBackup(tempReader)
 	}
 
 	// Save the file as a temporary file
-	tempPath := fmt.Sprintf("%s.temp", config.GetDBPath())
+	tempPath = fmt.Sprintf("%s.temp", config.GetDBPath())
 
 	// Remove the existing temporary file (if any)
 	if _, err := os.Stat(tempPath); err == nil {
@@ -1159,7 +1189,10 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 	}()
 
 	// Save uploaded file to temporary file
-	if _, err = io.Copy(tempFile, file); err != nil {
+	if _, err = tempReader.Seek(0, 0); err != nil {
+		return common.NewErrorf("Error resetting temporary upload file: %v", err)
+	}
+	if _, err = io.Copy(tempFile, tempReader); err != nil {
 		return common.NewErrorf("Error saving db: %v", err)
 	}
 

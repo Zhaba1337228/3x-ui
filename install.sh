@@ -175,6 +175,50 @@ install_postgres_local() {
     return 0
 }
 
+configure_local_postgres_security() {
+    local pg_port="$1"
+    local pg_conf=""
+    local pg_hba=""
+
+    pg_conf=$(find /etc/postgresql -type f -name postgresql.conf 2>/dev/null | head -n 1)
+    pg_hba=$(find /etc/postgresql -type f -name pg_hba.conf 2>/dev/null | head -n 1)
+
+    if [[ -z "${pg_conf}" ]]; then
+        pg_conf=$(find /var/lib/pgsql -type f -name postgresql.conf 2>/dev/null | head -n 1)
+    fi
+    if [[ -z "${pg_hba}" ]]; then
+        pg_hba=$(find /var/lib/pgsql -type f -name pg_hba.conf 2>/dev/null | head -n 1)
+    fi
+    if [[ -z "${pg_conf}" ]]; then
+        pg_conf=$(find /var/lib/postgres -type f -name postgresql.conf 2>/dev/null | head -n 1)
+    fi
+    if [[ -z "${pg_hba}" ]]; then
+        pg_hba=$(find /var/lib/postgres -type f -name pg_hba.conf 2>/dev/null | head -n 1)
+    fi
+
+    if [[ -n "${pg_conf}" ]]; then
+        sed -i "s/^#\?listen_addresses *=.*/listen_addresses = '127.0.0.1'/" "${pg_conf}" 2>/dev/null || true
+        if [[ -n "${pg_port}" ]]; then
+            sed -i "s/^#\?port *=.*/port = ${pg_port}/" "${pg_conf}" 2>/dev/null || true
+        fi
+        if ! grep -q "^password_encryption *= *scram-sha-256" "${pg_conf}" 2>/dev/null; then
+            echo "password_encryption = scram-sha-256" >> "${pg_conf}"
+        fi
+    fi
+
+    if [[ -n "${pg_hba}" ]]; then
+        cat > "${pg_hba}" <<'EOF'
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+local   all             postgres                                peer
+local   all             all                                     scram-sha-256
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+EOF
+    fi
+
+    systemctl restart postgresql >/dev/null 2>&1 || rc-service postgresql restart >/dev/null 2>&1 || true
+}
+
 bootstrap_local_postgres() {
     local db_name="$1"
     local db_user="$2"
@@ -277,6 +321,9 @@ configure_database_env() {
 
         echo -e "${yellow}Installing/configuring local PostgreSQL...${plain}"
         install_postgres_local || return 1
+        configure_local_postgres_security "${pg_port}"
+        pg_host="127.0.0.1"
+        pg_sslmode="disable"
         bootstrap_local_postgres "${pg_db}" "${pg_user}" "${pg_password}" || return 1
     else
         read -rp "PostgreSQL host [default 127.0.0.1]: " pg_host

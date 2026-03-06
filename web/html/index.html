@@ -1073,7 +1073,7 @@
       importDatabase() {
         const fileInput = document.createElement('input');
         fileInput.type = 'file';
-        fileInput.accept = '.db';
+        fileInput.accept = '.db,.json';
         fileInput.addEventListener('change', async (event) => {
           const dbFile = event.target.files[0];
           if (dbFile) {
