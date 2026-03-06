@@ -90,6 +90,40 @@ postgres_cluster_on_port() {
     pg_lsclusters --no-header 2>/dev/null | awk -v p="${pg_port}" '$3 == p {found=1} END {exit(found ? 0 : 1)}'
 }
 
+postgres_cluster_status_on_port() {
+    local pg_port="$1"
+    if ! command -v pg_lsclusters >/dev/null 2>&1; then
+        return 1
+    fi
+    pg_lsclusters --no-header 2>/dev/null | awk -v p="${pg_port}" '$3 == p {print $4; exit}'
+}
+
+find_free_port() {
+    local start_port="${1:-5432}"
+    local end_port="${2:-65535}"
+    local candidate=""
+
+    for candidate in $(seq "${start_port}" "${end_port}"); do
+        if postgres_cluster_on_port "${candidate}"; then
+            continue
+        fi
+        if ! is_port_in_use "${candidate}"; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+get_primary_postgres_cluster() {
+    if ! command -v pg_lsclusters >/dev/null 2>&1; then
+        return 1
+    fi
+
+    pg_lsclusters --no-header 2>/dev/null | awk 'NR==1 {print $1" "$2" "$3" "$4; exit}'
+}
+
 choose_postgres_port() {
     local default_port="${1:-5432}"
     local selected_port=""
@@ -103,7 +137,13 @@ choose_postgres_port() {
         fi
 
         if postgres_cluster_on_port "${selected_port}"; then
-            echo -e "${green}Existing PostgreSQL cluster already uses port ${selected_port}. Will reuse it.${plain}"
+            local cluster_status=""
+            cluster_status=$(postgres_cluster_status_on_port "${selected_port}" 2>/dev/null || true)
+            if [[ "${cluster_status}" == "online" ]]; then
+                echo -e "${green}Existing PostgreSQL cluster already uses port ${selected_port}. Will reuse it.${plain}"
+            else
+                echo -e "${yellow}PostgreSQL cluster is configured for port ${selected_port} but is not running. Installer will recover or move it automatically if needed.${plain}"
+            fi
             echo "${selected_port}"
             return 0
         fi
@@ -179,7 +219,6 @@ upsert_env_var() {
 }
 
 install_postgres_local() {
-    local pg_port="${1:-5432}"
     case "${release}" in
         ubuntu | debian | armbian)
             apt-get update && apt-get install -y -q postgresql postgresql-contrib
@@ -228,21 +267,6 @@ install_postgres_local() {
         ;;
     esac
 
-    if command -v pg_isready >/dev/null 2>&1; then
-        local ready=0
-        for _ in $(seq 1 15); do
-            if pg_isready -h 127.0.0.1 -p "${pg_port}" >/dev/null 2>&1 || pg_isready >/dev/null 2>&1; then
-                ready=1
-                break
-            fi
-            sleep 1
-        done
-        if [[ "${ready}" != "1" ]]; then
-            echo -e "${red}PostgreSQL did not become ready in time.${plain}"
-            return 1
-        fi
-    fi
-
     return 0
 }
 
@@ -289,13 +313,58 @@ ensure_postgres_running() {
     return 1
 }
 
+prepare_local_postgres_port() {
+    local requested_port="${1:-5432}"
+    local effective_port="${requested_port}"
+    local cluster_status=""
+
+    cluster_status=$(postgres_cluster_status_on_port "${requested_port}" 2>/dev/null || true)
+
+    if is_port_in_use "${requested_port}"; then
+        if ! postgres_cluster_on_port "${requested_port}" || [[ "${cluster_status}" != "online" ]]; then
+            local replacement_port=""
+            replacement_port=$(find_free_port 1024 65535) || {
+                echo -e "${red}No free TCP port was found for local PostgreSQL.${plain}" >&2
+                return 1
+            }
+            echo -e "${yellow}Port ${requested_port} is already occupied by another process. Using port ${replacement_port} for PostgreSQL instead.${plain}" >&2
+            echo -e "${yellow}Listener:${plain} $(get_listening_process_for_port "${requested_port}")" >&2
+            effective_port="${replacement_port}"
+        fi
+    fi
+
+    if [[ "${effective_port}" == "${requested_port}" ]] && postgres_cluster_on_port "${requested_port}" && [[ "${cluster_status}" == "online" ]]; then
+        echo -e "${green}Existing PostgreSQL cluster already runs on port ${requested_port}. Reusing it.${plain}" >&2
+    fi
+
+    echo "${effective_port}"
+    return 0
+}
+
 configure_local_postgres_security() {
     local pg_port="$1"
     local pg_conf=""
     local pg_hba=""
+    local cluster_ver=""
+    local cluster_name=""
+    local cluster_info=""
 
-    pg_conf=$(find /etc/postgresql -type f -name postgresql.conf 2>/dev/null | head -n 1)
-    pg_hba=$(find /etc/postgresql -type f -name pg_hba.conf 2>/dev/null | head -n 1)
+    cluster_info=$(get_primary_postgres_cluster)
+    if [[ -n "${cluster_info}" ]]; then
+        cluster_ver=$(echo "${cluster_info}" | awk '{print $1}')
+        cluster_name=$(echo "${cluster_info}" | awk '{print $2}')
+        if [[ -d "/etc/postgresql/${cluster_ver}/${cluster_name}" ]]; then
+            pg_conf="/etc/postgresql/${cluster_ver}/${cluster_name}/postgresql.conf"
+            pg_hba="/etc/postgresql/${cluster_ver}/${cluster_name}/pg_hba.conf"
+        fi
+    fi
+
+    if [[ -z "${pg_conf}" ]]; then
+        pg_conf=$(find /etc/postgresql -type f -name postgresql.conf 2>/dev/null | head -n 1)
+    fi
+    if [[ -z "${pg_hba}" ]]; then
+        pg_hba=$(find /etc/postgresql -type f -name pg_hba.conf 2>/dev/null | head -n 1)
+    fi
 
     if [[ -z "${pg_conf}" ]]; then
         pg_conf=$(find /var/lib/pgsql -type f -name postgresql.conf 2>/dev/null | head -n 1)
@@ -330,7 +399,11 @@ host    all             all             ::1/128                 scram-sha-256
 EOF
     fi
 
-    systemctl restart postgresql >/dev/null 2>&1 || rc-service postgresql restart >/dev/null 2>&1 || true
+    if [[ -n "${cluster_ver}" && -n "${cluster_name}" ]] && command -v pg_ctlcluster >/dev/null 2>&1; then
+        pg_ctlcluster "${cluster_ver}" "${cluster_name}" restart >/dev/null 2>&1 || pg_ctlcluster "${cluster_ver}" "${cluster_name}" start >/dev/null 2>&1 || true
+    else
+        systemctl restart postgresql >/dev/null 2>&1 || rc-service postgresql restart >/dev/null 2>&1 || true
+    fi
     ensure_postgres_running "${pg_port}" || return 1
 }
 
@@ -450,8 +523,9 @@ configure_database_env() {
         fi
 
         echo -e "${yellow}Installing/configuring local PostgreSQL...${plain}"
-        install_postgres_local "${pg_port}" || return 1
-        configure_local_postgres_security "${pg_port}"
+        install_postgres_local || return 1
+        pg_port=$(prepare_local_postgres_port "${pg_port}") || return 1
+        configure_local_postgres_security "${pg_port}" || return 1
         pg_host="127.0.0.1"
         pg_sslmode="disable"
         if id postgres >/dev/null 2>&1; then
