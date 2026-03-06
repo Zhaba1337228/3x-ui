@@ -180,8 +180,9 @@ bootstrap_local_postgres() {
     local db_user="$2"
     local db_password="$3"
 
-    local sql="
-DO \$\$
+    if id postgres >/dev/null 2>&1; then
+        su - postgres -c "psql -v ON_ERROR_STOP=1 -d postgres" <<SQL || return 1
+DO \$dbsetup\$
 BEGIN
    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${db_user}') THEN
       CREATE ROLE ${db_user} LOGIN PASSWORD '${db_password}';
@@ -189,25 +190,32 @@ BEGIN
       ALTER ROLE ${db_user} WITH LOGIN PASSWORD '${db_password}';
    END IF;
 END
-\$\$;
-"
+\$dbsetup\$;
+SQL
 
-    local db_sql="
-DO \$\$
+        local db_exists
+        db_exists=$(su - postgres -c "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${db_name}'\"")
+        if [[ "${db_exists}" != "1" ]]; then
+            su - postgres -c "createdb -O ${db_user} ${db_name}" || return 1
+        fi
+    else
+        psql -U postgres -v ON_ERROR_STOP=1 -d postgres <<SQL || return 1
+DO \$dbsetup\$
 BEGIN
-   IF NOT EXISTS (SELECT FROM pg_database WHERE datname = '${db_name}') THEN
-      CREATE DATABASE ${db_name} OWNER ${db_user};
+   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${db_user}') THEN
+      CREATE ROLE ${db_user} LOGIN PASSWORD '${db_password}';
+   ELSE
+      ALTER ROLE ${db_user} WITH LOGIN PASSWORD '${db_password}';
    END IF;
 END
-\$\$;
-"
+\$dbsetup\$;
+SQL
 
-    if id postgres >/dev/null 2>&1; then
-        su - postgres -c "psql -v ON_ERROR_STOP=1 -d postgres -c \"${sql}\"" || return 1
-        su - postgres -c "psql -v ON_ERROR_STOP=1 -d postgres -c \"${db_sql}\"" || return 1
-    else
-        psql -U postgres -v ON_ERROR_STOP=1 -d postgres -c "${sql}" || return 1
-        psql -U postgres -v ON_ERROR_STOP=1 -d postgres -c "${db_sql}" || return 1
+        local db_exists
+        db_exists=$(psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db_name}'")
+        if [[ "${db_exists}" != "1" ]]; then
+            createdb -U postgres -O "${db_user}" "${db_name}" || return 1
+        fi
     fi
 
     return 0
