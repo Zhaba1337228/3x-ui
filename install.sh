@@ -212,7 +212,16 @@ ensure_postgres_running() {
 
     systemctl start postgresql >/dev/null 2>&1 || rc-service postgresql start >/dev/null 2>&1 || true
 
-    if command -v pg_isready >/dev/null 2>&1; then
+    if command -v pg_lsclusters >/dev/null 2>&1; then
+        for _ in $(seq 1 20); do
+            local cluster_status
+            cluster_status=$(pg_lsclusters --no-header 2>/dev/null | awk -v p="${pg_port}" '$3 == p {print $4; exit}')
+            if [[ "${cluster_status}" == "online" ]]; then
+                return 0
+            fi
+            sleep 1
+        done
+    elif command -v pg_isready >/dev/null 2>&1; then
         for _ in $(seq 1 20); do
             if pg_isready -h 127.0.0.1 -p "${pg_port}" >/dev/null 2>&1; then
                 return 0
@@ -221,14 +230,24 @@ ensure_postgres_running() {
         done
     fi
 
-    if ss -ltn 2>/dev/null | grep -q ":${pg_port}[[:space:]]"; then
-        return 0
+    if is_port_in_use "${pg_port}"; then
+        echo -e "${red}Port ${pg_port} is already occupied by another process.${plain}"
+        echo -e "${yellow}Listener:${plain} $(get_listening_process_for_port "${pg_port}")"
     fi
 
     echo -e "${red}PostgreSQL is still not running on 127.0.0.1:${pg_port}.${plain}"
     if command -v pg_lsclusters >/dev/null 2>&1; then
         echo -e "${yellow}Current clusters:${plain}"
         pg_lsclusters || true
+    fi
+    return 1
+}
+
+get_listening_process_for_port() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print; exit}'
+        return
     fi
     return 1
 }
@@ -287,7 +306,7 @@ bootstrap_local_postgres() {
     ensure_postgres_running "${pg_port}" || return 1
 
     if id postgres >/dev/null 2>&1; then
-        su - postgres -c "psql -v ON_ERROR_STOP=1 -d postgres" <<SQL || return 1
+        su - postgres -c "psql -p ${pg_port} -v ON_ERROR_STOP=1 -d postgres" <<SQL || return 1
 DO \$dbsetup\$
 BEGIN
    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${db_user}') THEN
@@ -300,12 +319,12 @@ END
 SQL
 
         local db_exists
-        db_exists=$(su - postgres -c "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${db_name}'\"")
+        db_exists=$(su - postgres -c "psql -p ${pg_port} -tAc \"SELECT 1 FROM pg_database WHERE datname='${db_name}'\"")
         if [[ "${db_exists}" != "1" ]]; then
-            su - postgres -c "createdb -O ${db_user} ${db_name}" || return 1
+            su - postgres -c "createdb -p ${pg_port} -O ${db_user} ${db_name}" || return 1
         fi
     else
-        psql -U postgres -v ON_ERROR_STOP=1 -d postgres <<SQL || return 1
+        psql -p "${pg_port}" -U postgres -v ON_ERROR_STOP=1 -d postgres <<SQL || return 1
 DO \$dbsetup\$
 BEGIN
    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${db_user}') THEN
@@ -318,9 +337,9 @@ END
 SQL
 
         local db_exists
-        db_exists=$(psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db_name}'")
+        db_exists=$(psql -p "${pg_port}" -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db_name}'")
         if [[ "${db_exists}" != "1" ]]; then
-            createdb -U postgres -O "${db_user}" "${db_name}" || return 1
+            createdb -p "${pg_port}" -U postgres -O "${db_user}" "${db_name}" || return 1
         fi
     fi
 
